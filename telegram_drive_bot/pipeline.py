@@ -53,6 +53,15 @@ def _date_from_name(filename: str) -> str:
     return m.group(1) if m else datetime.today().strftime("%Y%m%d")
 
 
+class DuplicateWeekError(Exception):
+    """Raised when the upload's snapshot date already exists in weekly_jsons/."""
+
+    def __init__(self, week: str, existing_path: Path):
+        self.week = week
+        self.existing_path = existing_path
+        super().__init__(f"Week {week} already exists ({existing_path.name})")
+
+
 def step_extract(local_path: Path) -> Path:
     """Extract zip → weekly JSON, or copy JSON straight in."""
     WEEKLY_JSONS_DIR.mkdir(exist_ok=True)
@@ -139,6 +148,12 @@ def run(service, local_path: Path) -> dict:
         latest_week  — most recent week string (YYYY-MM-DD)
     """
     print(f"\n=== Pipeline: {local_path.name} ===")
+
+    snap = _date_from_name(local_path.name)
+    existing = WEEKLY_JSONS_DIR / f"kz_config_{snap}.json"
+    if existing.exists():
+        print(f"  Week {snap} already present ({existing.name}) — skipping.")
+        raise DuplicateWeekError(snap, existing)
 
     out_json = step_extract(local_path)
     step_prune(MAX_WEEKS)

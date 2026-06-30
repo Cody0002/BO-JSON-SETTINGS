@@ -202,6 +202,7 @@ class PipelineResult:
     drive_link: str
     weeks_count: int
     latest_week: str
+    duplicate: bool = False
 
 
 def process_document(
@@ -227,11 +228,26 @@ def process_document(
     download_telegram_file(token, remote_path, local_path)
 
     original_name = sanitize_filename(str(document.get("file_name") or local_path.name))
+    chat = message.get("chat") or {}
 
-    result = _pipeline.run(drive_service, local_path)
+    try:
+        result = _pipeline.run(drive_service, local_path)
+    except _pipeline.DuplicateWeekError as exc:
+        seen_ids.add(file_unique_id)
+        local_path.unlink(missing_ok=True)
+        week_fmt = f"{exc.week[:4]}-{exc.week[4:6]}-{exc.week[6:]}" if len(exc.week) == 8 else exc.week
+        return PipelineResult(
+            chat_id=int(chat.get("id")),
+            message_id=int(message.get("message_id")),
+            original_name=original_name,
+            drive_link="",
+            weeks_count=0,
+            latest_week=week_fmt,
+            duplicate=True,
+        )
+
     seen_ids.add(file_unique_id)
 
-    chat = message.get("chat") or {}
     return PipelineResult(
         chat_id=int(chat.get("id")),
         message_id=int(message.get("message_id")),
@@ -314,17 +330,29 @@ def run_bot(
 
                 state["uploaded_file_unique_ids"] = sorted(seen_ids)
                 save_state(state_path, state)
-                print(f"Pipeline done: {result.original_name} → dashboard updated ({result.weeks_count} weeks, latest {result.latest_week})")
+
+                if result.duplicate:
+                    print(f"Duplicate week: {result.original_name} → week {result.latest_week} already available, skipped.")
+                else:
+                    print(f"Pipeline done: {result.original_name} → dashboard updated ({result.weeks_count} weeks, latest {result.latest_week})")
 
                 if reply_on_upload:
-                    link_part = f'\n<a href="{result.drive_link}">Open Dashboard</a>' if result.drive_link else ""
-                    send_reply(
-                        token,
-                        result.chat_id,
-                        result.message_id,
-                        f"OpsAnalyst dashboard updated from <b>{result.original_name}</b>\n"
-                        f"Latest snapshot: <b>{result.latest_week}</b> ({result.weeks_count} weeks){link_part}",
-                    )
+                    if result.duplicate:
+                        send_reply(
+                            token,
+                            result.chat_id,
+                            result.message_id,
+                            f"This data is already available — week <b>{result.latest_week}</b> was already processed. No update needed.",
+                        )
+                    else:
+                        link_part = f'\n<a href="{result.drive_link}">Open Dashboard</a>' if result.drive_link else ""
+                        send_reply(
+                            token,
+                            result.chat_id,
+                            result.message_id,
+                            f"OpsAnalyst dashboard updated from <b>{result.original_name}</b>\n"
+                            f"Latest snapshot: <b>{result.latest_week}</b> ({result.weeks_count} weeks){link_part}",
+                        )
 
             save_state(state_path, state)
 
