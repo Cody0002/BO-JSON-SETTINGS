@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+env/
+venv/
+.venv/
+
+# Google OAuth tokens & credentials (sensitive — never commit)
+telegram_drive_bot/token.json
+telegram_drive_bot/credentials.json
+
+# Bot secrets & runtime state
+telegram_drive_bot/.env
+telegram_drive_bot/bot_state.json
+telegram_drive_bot/telegram_downloads/
+
+# Generated data files
+dashboard_data.json
+csv_output/
+kz_config.json
+
+# Dashboard scripts (local-only)
+DASHBOARD SCRIPT/
+DASHBOARD SCRIPT - BACKUP/
+
+# Raw zip files
+*.zip
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
