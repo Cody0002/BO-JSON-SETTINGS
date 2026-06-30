@@ -1,0 +1,15 @@
+[Unit]
+Description=BO JSON Settings Telegram Drive Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/BO-JSON-SETTINGS/telegram_drive_bot
+ExecStart=/home/ubuntu/BO-JSON-SETTINGS/env/bin/python -u bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
