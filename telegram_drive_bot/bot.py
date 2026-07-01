@@ -190,6 +190,14 @@ def parse_allowed_chat_ids(raw: str) -> Optional[Set[int]]:
     return {int(x.strip()) for x in raw.split(",") if x.strip()}
 
 
+def format_snapshot(week: str) -> str:
+    """Format a 'YYYY-MM-DD' week string as '30 Jun 2026'; pass through if unparseable."""
+    try:
+        return datetime.strptime(week, "%Y-%m-%d").strftime("%d %b %Y")
+    except (ValueError, TypeError):
+        return week
+
+
 # ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
@@ -231,7 +239,7 @@ def process_document(
     chat = message.get("chat") or {}
 
     try:
-        result = _pipeline.run(drive_service, local_path)
+        result = _pipeline.run(drive_service, local_path, original_name=original_name)
     except _pipeline.DuplicateWeekError as exc:
         seen_ids.add(file_unique_id)
         local_path.unlink(missing_ok=True)
@@ -337,21 +345,23 @@ def run_bot(
                     print(f"Pipeline done: {result.original_name} -> dashboard updated ({result.weeks_count} weeks, latest {result.latest_week})")
 
                 if reply_on_upload:
+                    snapshot = format_snapshot(result.latest_week)
+                    dashboard_link = f'<a href="{_pipeline.DASHBOARD_URL}">Open Dashboard</a>'
                     if result.duplicate:
                         send_reply(
                             token,
                             result.chat_id,
                             result.message_id,
-                            f"This data is already available — week <b>{result.latest_week}</b> was already processed. No update needed.",
+                            f"This data is already available — snapshot <b>{snapshot}</b> was already processed. No update needed.",
                         )
                     else:
-                        link_part = f'\n<a href="{result.drive_link}">Open Dashboard</a>' if result.drive_link else ""
                         send_reply(
                             token,
                             result.chat_id,
                             result.message_id,
-                            f"OpsAnalyst dashboard updated from <b>{result.original_name}</b>\n"
-                            f"Latest snapshot: <b>{result.latest_week}</b> ({result.weeks_count} weeks){link_part}",
+                            f"KZG BO Settings dashboard updated from <b>{result.original_name}</b>\n"
+                            f"- Latest Snapshot: <b>{snapshot}</b>\n"
+                            f"- {dashboard_link}",
                         )
 
             save_state(state_path, state)

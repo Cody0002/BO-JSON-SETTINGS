@@ -33,6 +33,9 @@ DASHBOARD_JSON = ROOT / "dashboard_data.json"
 # Google Drive file to overwrite (the shared dashboard file)
 DASHBOARD_DRIVE_FILE_ID = "1GbojsFtJ2DZuC9yGDWIMWpN1T-qOIcie"
 
+# Public dashboard (Google Apps Script web app) shown in Telegram replies
+DASHBOARD_URL = "https://script.google.com/a/macros/kzgroup.biz/s/AKfycbwrXly-JKgeZQ6Wj52rIjJUEIs44Jv_vFK-hIuG61ma_kk1C9_Za6Z2gj9rk9JM720/exec"
+
 MAX_WEEKS = 6
 
 # ---------------------------------------------------------------------------
@@ -62,10 +65,9 @@ class DuplicateWeekError(Exception):
         super().__init__(f"Week {week} already exists ({existing_path.name})")
 
 
-def step_extract(local_path: Path) -> Path:
+def step_extract(local_path: Path, snap: str) -> Path:
     """Extract zip -> weekly JSON, or copy JSON straight in."""
     WEEKLY_JSONS_DIR.mkdir(exist_ok=True)
-    snap = _date_from_name(local_path.name)
     out = WEEKLY_JSONS_DIR / f"kz_config_{snap}.json"
 
     if local_path.suffix.lower() == ".zip":
@@ -138,9 +140,13 @@ def step_cleanup_zip(local_path: Path) -> None:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def run(service, local_path: Path) -> dict:
+def run(service, local_path: Path, original_name: Optional[str] = None) -> dict:
     """
     Run the full pipeline for a downloaded *config.zip or *config.json.
+
+    The snapshot date is taken from ``original_name`` (the filename as sent,
+    e.g. ``20260630_kz-group-config.zip``) so it reflects the data's week and
+    not the download timestamp. Falls back to ``local_path`` if not provided.
 
     Returns a dict with:
         drive_link   — webViewLink of the overwritten dashboard file
@@ -149,13 +155,13 @@ def run(service, local_path: Path) -> dict:
     """
     print(f"\n=== Pipeline: {local_path.name} ===")
 
-    snap = _date_from_name(local_path.name)
+    snap = _date_from_name(original_name or local_path.name)
     existing = WEEKLY_JSONS_DIR / f"kz_config_{snap}.json"
     if existing.exists():
         print(f"  Week {snap} already present ({existing.name}) - skipping.")
         raise DuplicateWeekError(snap, existing)
 
-    out_json = step_extract(local_path)
+    out_json = step_extract(local_path, snap)
     step_prune(MAX_WEEKS)
     dashboard_path, weeks = step_build_dashboard()
     drive_result = step_overwrite_drive(service, dashboard_path)
