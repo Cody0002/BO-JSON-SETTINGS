@@ -332,9 +332,9 @@ def run_bot(
                 save_state(state_path, state)
 
                 if result.duplicate:
-                    print(f"Duplicate week: {result.original_name} → week {result.latest_week} already available, skipped.")
+                    print(f"Duplicate week: {result.original_name} -> week {result.latest_week} already available, skipped.")
                 else:
-                    print(f"Pipeline done: {result.original_name} → dashboard updated ({result.weeks_count} weeks, latest {result.latest_week})")
+                    print(f"Pipeline done: {result.original_name} -> dashboard updated ({result.weeks_count} weeks, latest {result.latest_week})")
 
                 if reply_on_upload:
                     if result.duplicate:
@@ -427,7 +427,7 @@ def main() -> int:
 
     if not Path(args.credentials_file).exists():
         print(f"credentials.json not found: {args.credentials_file}", file=sys.stderr)
-        print("Download it from: Google Cloud Console → APIs & Services → Credentials → OAuth 2.0 Client ID → Desktop app", file=sys.stderr)
+        print("Download it from: Google Cloud Console -> APIs & Services -> Credentials -> OAuth 2.0 Client ID -> Desktop app", file=sys.stderr)
         return 2
 
     drive_service = build_drive_service(args.credentials_file, args.token_file)

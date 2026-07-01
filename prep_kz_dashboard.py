@@ -345,6 +345,6 @@ def main():
     weeks = sanitize(weeks)
     with open(args.out,'w',encoding='utf-8') as f:
         json.dump(weeks, f, separators=(',',':'), allow_nan=False)
-    print(f'\n✓ {args.out} ({os.path.getsize(args.out)/1024:.0f} KB, {len(weeks)} week(s))')
+    print(f'\nOK {args.out} ({os.path.getsize(args.out)/1024:.0f} KB, {len(weeks)} week(s))')
 
 if __name__=='__main__': main()

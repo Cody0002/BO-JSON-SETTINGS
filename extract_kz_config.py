@@ -269,7 +269,7 @@ def extract(av_path=None, fp_path=None, fm_path=None, zip_path=None, out_path='k
         json.dump(output, f, ensure_ascii=False, separators=(',',':'), default=str, allow_nan=False)
 
     size_mb = os.path.getsize(out_path) / 1e6
-    print(f'\n✓ {out_path} ({size_mb:.1f} MB)')
+    print(f'\nOK {out_path} ({size_mb:.1f} MB)')
     # Validation
     for g in sorted(output['meta']['groups'])[:3]:
         gd = av.get(g,{})

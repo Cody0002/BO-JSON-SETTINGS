@@ -1,9 +1,9 @@
 """
-Full pipeline: *config.zip / *config.json → weekly_jsons → dashboard_data.json → overwrite Drive.
+Full pipeline: *config.zip / *config.json -> weekly_jsons -> dashboard_data.json -> overwrite Drive.
 
 Steps
 -----
-1. Extract zip (or copy json) → weekly_jsons/kz_config_YYYYMMDD.json
+1. Extract zip (or copy json) -> weekly_jsons/kz_config_YYYYMMDD.json
 2. Prune weekly_jsons to MAX_WEEKS most recent files
 3. Build dashboard_data.json from all remaining weekly JSONs
 4. Overwrite the existing Drive file (keeps same ID, name, location)
@@ -63,16 +63,16 @@ class DuplicateWeekError(Exception):
 
 
 def step_extract(local_path: Path) -> Path:
-    """Extract zip → weekly JSON, or copy JSON straight in."""
+    """Extract zip -> weekly JSON, or copy JSON straight in."""
     WEEKLY_JSONS_DIR.mkdir(exist_ok=True)
     snap = _date_from_name(local_path.name)
     out = WEEKLY_JSONS_DIR / f"kz_config_{snap}.json"
 
     if local_path.suffix.lower() == ".zip":
-        print(f"  Extracting {local_path.name} → {out.name} ...")
+        print(f"  Extracting {local_path.name} -> {out.name} ...")
         extract(zip_path=str(local_path), out_path=str(out))
     else:
-        print(f"  Copying {local_path.name} → {out.name} ...")
+        print(f"  Copying {local_path.name} -> {out.name} ...")
         shutil.copy2(local_path, out)
 
     return out
@@ -91,7 +91,7 @@ def step_build_dashboard() -> tuple[Path, list]:
     """Read all weekly JSONs and write dashboard_data.json."""
     files = sorted(WEEKLY_JSONS_DIR.glob("*.json"))
     if not files:
-        raise RuntimeError("No weekly JSONs found — cannot build dashboard.")
+        raise RuntimeError("No weekly JSONs found - cannot build dashboard.")
 
     weeks = []
     for fp in files:
@@ -106,7 +106,7 @@ def step_build_dashboard() -> tuple[Path, list]:
         encoding="utf-8",
     )
     size_kb = DASHBOARD_JSON.stat().st_size / 1024
-    print(f"  dashboard_data.json → {size_kb:.0f} KB, {len(weeks)} week(s)")
+    print(f"  dashboard_data.json -> {size_kb:.0f} KB, {len(weeks)} week(s)")
     return DASHBOARD_JSON, weeks
 
 
@@ -152,7 +152,7 @@ def run(service, local_path: Path) -> dict:
     snap = _date_from_name(local_path.name)
     existing = WEEKLY_JSONS_DIR / f"kz_config_{snap}.json"
     if existing.exists():
-        print(f"  Week {snap} already present ({existing.name}) — skipping.")
+        print(f"  Week {snap} already present ({existing.name}) - skipping.")
         raise DuplicateWeekError(snap, existing)
 
     out_json = step_extract(local_path)
