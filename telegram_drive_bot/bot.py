@@ -1,7 +1,7 @@
 """
 Telegram → Google Drive bot.
 
-Joins Telegram groups, records them when first seen, and watches for config.json file uploads.
+Joins Telegram groups, records them when first seen, and watches for config.zip/config.json file uploads.
 Each matching file is downloaded and immediately uploaded to a Google Drive folder.
 
 Setup:
@@ -70,9 +70,13 @@ def load_pipeline():
 # File-type detection
 # ---------------------------------------------------------------------------
 
-def is_target_document(document: Dict[str, Any]) -> bool:
+def is_target_document(document: Dict[str, Any], message: Optional[Dict[str, Any]] = None) -> bool:
     file_name = str(document.get("file_name") or "").lower()
-    return "config.json" in file_name
+    caption = str((message or {}).get("caption") or "").lower()
+    is_config_name = file_name.endswith("config.zip") or file_name.endswith("config.json")
+    is_supported_file = file_name.endswith(".zip") or file_name.endswith(".json")
+    is_config_caption = "config export" in caption or "group config" in caption
+    return is_config_name or (is_supported_file and is_config_caption)
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +343,7 @@ def build_greeting(bot_name: str) -> str:
     """Short, friendly intro the bot posts when it joins a group."""
     return (
         f"👋 Hi, I'm <b>{bot_name}</b>! 🤖\n"
-        f"Just drop the weekly <b>*config.json</b> here and I'll auto-refresh the dashboard for you. ✨📊"
+        f"Just drop the weekly <b>*config.zip</b> or <b>*config.json</b> here and I'll auto-refresh the dashboard for you. ✨📊"
     )
 
 
@@ -393,6 +397,13 @@ def sanitize_filename(name: str) -> str:
     return name or "telegram_upload"
 
 
+def source_label_for_snapshot(message: Dict[str, Any], document: Dict[str, Any], fallback_path: Path) -> str:
+    """Caption first, then filename, so the weekly date can come from either."""
+    caption = str(message.get("caption") or "").strip()
+    file_name = sanitize_filename(str(document.get("file_name") or fallback_path.name))
+    return f"{caption} {file_name}".strip() if caption else file_name
+
+
 def staging_path(download_dir: Path, message: Dict[str, Any], document: Dict[str, Any]) -> Path:
     chat = message.get("chat") or {}
     chat_id = chat.get("id", "unknown")
@@ -442,12 +453,13 @@ def process_document(
 ) -> Optional[PipelineResult]:
     pipeline = load_pipeline()
     document = message.get("document")
-    if not isinstance(document, dict) or not is_target_document(document):
+    if not isinstance(document, dict) or not is_target_document(document, message):
         return None
 
+    # Always download and run the full pipeline, even for a file we've seen
+    # before: the pipeline dedups by snapshot week and the bot replies
+    # "already processed" instead of staying silent on re-uploads.
     file_unique_id = str(document.get("file_unique_id") or document.get("file_id") or "")
-    if file_unique_id in seen_ids:
-        return None
 
     file_id = str(document["file_id"])
     file_info = telegram_api(token, "getFile", {"file_id": file_id})
@@ -517,7 +529,7 @@ def run_bot(
         print(f"Warning: getMe failed ({exc}); group greetings disabled.", file=sys.stderr)
         bot_id, bot_name, bot_username = None, "KZG BO Bot", ""
 
-    print("Telegram Drive bot is running. Waiting for *config.json uploads...")
+    print("Telegram Drive bot is running. Waiting for *config.zip / *config.json uploads...")
     print(f"Staging directory : {download_dir.resolve()}")
     print(f"Dashboard file ID : {pipeline.DASHBOARD_DRIVE_FILE_ID}")
     if bot_id is not None:
@@ -661,7 +673,7 @@ def run_bot(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Watch Telegram groups for config.json uploads and push them to Google Drive."
+        description="Watch Telegram groups for config.zip/config.json uploads and push them to Google Drive."
     )
     p.add_argument(
         "--token",
