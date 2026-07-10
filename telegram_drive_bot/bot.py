@@ -1,7 +1,7 @@
 """
 Telegram → Google Drive bot.
 
-Joins a Telegram group and watches for .zip or .json file uploads.
+Joins Telegram groups, records them when first seen, and watches for config.json file uploads.
 Each matching file is downloaded and immediately uploaded to a Google Drive folder.
 
 Setup:
@@ -34,14 +34,12 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
-
-from drive_uploader import build_drive_service
-import pipeline as _pipeline
 
 
 def _load_env_file(path: Path = Path(".env")) -> None:
@@ -62,13 +60,19 @@ def _load_env_file(path: Path = Path(".env")) -> None:
 _load_env_file(Path(__file__).parent / ".env")
 
 
+def load_pipeline():
+    import pipeline as pipeline_module
+
+    return pipeline_module
+
+
 # ---------------------------------------------------------------------------
 # File-type detection
 # ---------------------------------------------------------------------------
 
 def is_target_document(document: Dict[str, Any]) -> bool:
     file_name = str(document.get("file_name") or "").lower()
-    return file_name.endswith("config.zip") or file_name.endswith("config.json")
+    return "config.json" in file_name
 
 
 # ---------------------------------------------------------------------------
@@ -77,16 +81,17 @@ def is_target_document(document: Dict[str, Any]) -> bool:
 
 def load_state(path: Path) -> Dict[str, Any]:
     if not path.exists():
-        return {"next_update_id": None, "uploaded_file_unique_ids": []}
+        return {"next_update_id": None, "uploaded_file_unique_ids": [], "greeted_chat_ids": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             data.setdefault("next_update_id", None)
             data.setdefault("uploaded_file_unique_ids", [])
+            data.setdefault("greeted_chat_ids", [])
             return data
     except (OSError, json.JSONDecodeError):
         pass
-    return {"next_update_id": None, "uploaded_file_unique_ids": []}
+    return {"next_update_id": None, "uploaded_file_unique_ids": [], "greeted_chat_ids": []}
 
 
 def save_state(path: Path, state: Dict[str, Any]) -> None:
@@ -96,29 +101,161 @@ def save_state(path: Path, state: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+_GROUP_TYPES = {"group", "supergroup"}
+_MEMBER_STATUSES = {"member", "administrator", "creator"}
+_LEFT_STATUSES = {"left", "kicked", None}
+
+
+def record_known_chat(path: Path, chat: Dict[str, Any], bot_status: Optional[str] = None) -> None:
+    """Add/update a chat in the known-chats registry.
+
+    Telegram has no API to list the groups a bot belongs to, so we build the
+    roster ourselves: every chat that sends the bot a message or membership
+    update is recorded here (id, type, title, first/last seen). Useful for
+    discovering group IDs to put in TELEGRAM_ALLOWED_CHAT_IDS.
+    """
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+
+    key = str(chat_id)
+    now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    entry = data.get(key) or {}
+    entry.update(
+        {
+            "id": chat_id,
+            "type": chat.get("type"),
+            "title": chat.get("title") or chat.get("username") or chat.get("first_name"),
+            "last_seen": now,
+        }
+    )
+    if bot_status:
+        entry["bot_status"] = bot_status
+        entry["is_member"] = bot_status in _MEMBER_STATUSES
+    elif chat.get("type") in _GROUP_TYPES:
+        entry.setdefault("is_member", True)
+    entry.setdefault("first_seen", now)
+    data[key] = entry
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_known_chats(path: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def known_group_entries(path: Path, *, current_only: bool = True) -> list[Dict[str, Any]]:
+    entries = []
+    for entry in load_known_chats(path).values():
+        if not isinstance(entry, dict) or entry.get("type") not in _GROUP_TYPES:
+            continue
+        if current_only and entry.get("is_member") is False:
+            continue
+        entries.append(entry)
+    return sorted(entries, key=lambda e: (str(e.get("title") or "").casefold(), str(e.get("id") or "")))
+
+
+def format_known_groups_plain(path: Path) -> str:
+    groups = known_group_entries(path)
+    if not groups:
+        return "No known groups yet. Telegram does not expose old group membership; the bot will record groups when it is added or when it receives an update there."
+
+    lines = ["Known groups:"]
+    for entry in groups:
+        title = entry.get("title") or "unknown"
+        chat_id = entry.get("id")
+        status = entry.get("bot_status") or "seen"
+        last_seen = entry.get("last_seen") or "unknown"
+        lines.append(f"- {title} ({chat_id}) status={status} last_seen={last_seen}")
+    return "\n".join(lines)
+
+
+def format_known_groups_html(path: Path) -> str:
+    groups = known_group_entries(path)
+    if not groups:
+        return (
+            "No known groups yet.\n"
+            "Telegram does not expose old group membership; I will record groups when I am added or receive an update there."
+        )
+
+    lines = ["<b>Known groups</b>"]
+    for entry in groups[:50]:
+        title = escape(str(entry.get("title") or "unknown"))
+        chat_id = escape(str(entry.get("id") or "unknown"))
+        status = escape(str(entry.get("bot_status") or "seen"))
+        lines.append(f"- <code>{chat_id}</code> {title} ({status})")
+    if len(groups) > 50:
+        lines.append(f"...and {len(groups) - 50} more")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Telegram API helpers
 # ---------------------------------------------------------------------------
 
-def telegram_api(token: str, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+# Connection-level errors worth retrying (TLS handshake timeouts, dropped
+# sockets, transient DNS). ssl.SSLError and socket.timeout are OSError subclasses.
+_TRANSIENT_ERRORS = (URLError, TimeoutError, OSError)
+# HTTP statuses that are transient on Telegram's side (rate limit / gateway).
+_RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+
+
+def telegram_api(
+    token: str,
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    retries: int = 3,
+    backoff: float = 2.0,
+) -> Dict[str, Any]:
     query = f"?{urlencode(params)}" if params else ""
     url = f"https://api.telegram.org/bot{token}/{method}{query}"
     request = Request(url, headers={"User-Agent": "telegram-drive-bot/1.0"})
 
-    with urlopen(request, timeout=90) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            with urlopen(request, timeout=90) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not payload.get("ok"):
+                raise RuntimeError(f"Telegram API error for {method}: {payload}")
+            result = payload.get("result")
+            return result if isinstance(result, dict) else {"items": result}
+        except HTTPError as exc:  # subclass of URLError — must be caught first
+            if exc.code not in _RETRYABLE_HTTP or attempt >= retries:
+                raise
+            last_exc = exc
+        except _TRANSIENT_ERRORS as exc:
+            if attempt >= retries:
+                raise
+            last_exc = exc
+        print(
+            f"  Telegram {method}: transient error ({last_exc}); "
+            f"retry {attempt}/{retries - 1} in {backoff * attempt:.0f}s...",
+            file=sys.stderr,
+        )
+        time.sleep(backoff * attempt)
 
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram API error for {method}: {payload}")
-
-    result = payload.get("result")
-    return result if isinstance(result, dict) else {"items": result}
+    raise last_exc if last_exc else RuntimeError(f"Telegram API call failed: {method}")
 
 
 def iter_updates(token: str, offset: Optional[int], timeout_seconds: int) -> Iterable[Dict[str, Any]]:
     params: Dict[str, Any] = {
         "timeout": timeout_seconds,
-        "allowed_updates": json.dumps(["message", "channel_post"]),
+        "allowed_updates": json.dumps(["message", "channel_post", "my_chat_member"]),
     }
     if offset is not None:
         params["offset"] = offset
@@ -128,17 +265,36 @@ def iter_updates(token: str, offset: Optional[int], timeout_seconds: int) -> Ite
     return items if isinstance(items, list) else []
 
 
-def download_telegram_file(token: str, file_path: str, output_path: Path) -> None:
+def download_telegram_file(
+    token: str,
+    file_path: str,
+    output_path: Path,
+    *,
+    retries: int = 3,
+    backoff: float = 2.0,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     url = f"https://api.telegram.org/file/bot{token}/{file_path}"
     request = Request(url, headers={"User-Agent": "telegram-drive-bot/1.0"})
     tmp = output_path.with_suffix(output_path.suffix + ".part")
 
-    with urlopen(request, timeout=300) as response, tmp.open("wb") as out:
-        while chunk := response.read(1024 * 1024):
-            out.write(chunk)
-
-    tmp.replace(output_path)
+    for attempt in range(1, retries + 1):
+        try:
+            with urlopen(request, timeout=300) as response, tmp.open("wb") as out:
+                while chunk := response.read(1024 * 1024):
+                    out.write(chunk)
+            tmp.replace(output_path)
+            return
+        except _TRANSIENT_ERRORS as exc:
+            tmp.unlink(missing_ok=True)  # discard the partial file before retrying
+            if attempt >= retries:
+                raise
+            print(
+                f"  Download {output_path.name}: transient error ({exc}); "
+                f"retry {attempt}/{retries - 1} in {backoff * attempt:.0f}s...",
+                file=sys.stderr,
+            )
+            time.sleep(backoff * attempt)
 
 
 def send_reply(token: str, chat_id: int, message_id: int, text: str) -> None:
@@ -154,6 +310,19 @@ def send_reply(token: str, chat_id: int, message_id: int, text: str) -> None:
     )
 
 
+def send_message(token: str, chat_id: int, text: str) -> None:
+    telegram_api(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -164,6 +333,57 @@ def get_message(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if isinstance(msg, dict):
             return msg
     return None
+
+
+def build_greeting(bot_name: str) -> str:
+    """Short, friendly intro the bot posts when it joins a group."""
+    return (
+        f"👋 Hi, I'm <b>{bot_name}</b>! 🤖\n"
+        f"Just drop the weekly <b>*config.json</b> here and I'll auto-refresh the dashboard for you. ✨📊"
+    )
+
+
+def bot_group_membership_update(my_chat_member: Dict[str, Any], bot_id: int) -> Optional[tuple[Dict[str, Any], str]]:
+    """Return the group chat and new bot status from a bot membership update."""
+    new = my_chat_member.get("new_chat_member") or {}
+    if (new.get("user") or {}).get("id") != bot_id:
+        return None
+
+    chat = my_chat_member.get("chat") or {}
+    if chat.get("type") not in _GROUP_TYPES:
+        return None
+
+    status = new.get("status")
+    return (chat, str(status)) if status else None
+
+
+def bot_added_to_group(my_chat_member: Dict[str, Any], bot_id: int) -> Optional[Dict[str, Any]]:
+    """Return the chat if this my_chat_member update means the bot was just added to a group.
+
+    Fires on the transition from left/kicked (or first sight) into member/admin,
+    so a plain add and a later promotion don't both count as a fresh join.
+    """
+    membership = bot_group_membership_update(my_chat_member, bot_id)
+    if membership is None:
+        return None
+
+    chat, status = membership
+    old = my_chat_member.get("old_chat_member") or {}
+    if status in _MEMBER_STATUSES and old.get("status") in _LEFT_STATUSES:
+        return chat
+    return None
+
+
+def is_command(message: Dict[str, Any], command: str, bot_username: str = "") -> bool:
+    text = str(message.get("text") or "").strip()
+    if not text.startswith("/"):
+        return False
+
+    first = text.split()[0].lower()
+    expected = f"/{command.lower()}"
+    if first == expected:
+        return True
+    return bool(bot_username) and first == f"{expected}@{bot_username.lower()}"
 
 
 def sanitize_filename(name: str) -> str:
@@ -220,6 +440,7 @@ def process_document(
     seen_ids: Set[str],
     drive_service,
 ) -> Optional[PipelineResult]:
+    pipeline = load_pipeline()
     document = message.get("document")
     if not isinstance(document, dict) or not is_target_document(document):
         return None
@@ -239,8 +460,8 @@ def process_document(
     chat = message.get("chat") or {}
 
     try:
-        result = _pipeline.run(drive_service, local_path, original_name=original_name)
-    except _pipeline.DuplicateWeekError as exc:
+        result = pipeline.run(drive_service, local_path, original_name=original_name)
+    except pipeline.DuplicateWeekError as exc:
         seen_ids.add(file_unique_id)
         local_path.unlink(missing_ok=True)
         week_fmt = f"{exc.week[:4]}-{exc.week[4:6]}-{exc.week[6:]}" if len(exc.week) == 8 else exc.week
@@ -275,6 +496,7 @@ def run_bot(
     drive_service,
     download_dir: Path,
     state_path: Path,
+    known_chats_path: Optional[Path] = None,
     allowed_chat_ids: Optional[Set[int]] = None,
     poll_timeout_seconds: int = 50,
     reply_on_upload: bool = True,
@@ -282,11 +504,24 @@ def run_bot(
 ) -> None:
     state = load_state(state_path)
     seen_ids: Set[str] = {str(x) for x in state.get("uploaded_file_unique_ids", [])}
+    greeted_ids: Set[str] = {str(x) for x in state.get("greeted_chat_ids", [])}
     next_update_id: Optional[int] = state.get("next_update_id")
+    pipeline = load_pipeline()
 
-    print("Telegram Drive bot is running. Waiting for *config.zip / *config.json uploads...")
+    try:
+        me = telegram_api(token, "getMe")
+        bot_id: Optional[int] = int(me["id"])
+        bot_name = me.get("first_name") or me.get("username") or "KZG BO Bot"
+        bot_username = str(me.get("username") or "")
+    except (HTTPError, URLError, TimeoutError, RuntimeError, OSError, KeyError, ValueError) as exc:
+        print(f"Warning: getMe failed ({exc}); group greetings disabled.", file=sys.stderr)
+        bot_id, bot_name, bot_username = None, "KZG BO Bot", ""
+
+    print("Telegram Drive bot is running. Waiting for *config.json uploads...")
     print(f"Staging directory : {download_dir.resolve()}")
-    print(f"Dashboard file ID : {_pipeline.DASHBOARD_DRIVE_FILE_ID}")
+    print(f"Dashboard file ID : {pipeline.DASHBOARD_DRIVE_FILE_ID}")
+    if bot_id is not None:
+        print(f"Bot identity      : {bot_name} (id={bot_id})")
     if debug:
         print("[debug] Debug mode ON — all incoming updates will be printed.")
 
@@ -303,6 +538,31 @@ def run_bot(
                 if debug:
                     print(f"[debug] update: {json.dumps(update)}")
 
+                my_chat_member = update.get("my_chat_member")
+                if isinstance(my_chat_member, dict):
+                    if bot_id is not None:
+                        membership = bot_group_membership_update(my_chat_member, bot_id)
+                        if membership is not None and known_chats_path is not None:
+                            member_chat, status = membership
+                            record_known_chat(known_chats_path, member_chat, bot_status=status)
+                            if debug:
+                                print(f"[debug] bot status in {member_chat.get('title')} ({member_chat.get('id')}): {status}")
+
+                        joined_chat = bot_added_to_group(my_chat_member, bot_id)
+                        if joined_chat is not None:
+                            cid = joined_chat.get("id")
+                            allowed = allowed_chat_ids is None or cid in allowed_chat_ids
+                            if allowed and str(cid) not in greeted_ids:
+                                try:
+                                    send_message(token, cid, build_greeting(bot_name))
+                                    greeted_ids.add(str(cid))
+                                    state["greeted_chat_ids"] = sorted(greeted_ids)
+                                    save_state(state_path, state)
+                                    print(f"Greeted new group: {joined_chat.get('title')} ({cid})")
+                                except Exception as exc:
+                                    print(f"Failed to greet chat {cid}: {exc}", file=sys.stderr)
+                    continue
+
                 message = get_message(update)
                 if message is None:
                     continue
@@ -311,10 +571,30 @@ def run_bot(
                 chat_id = chat.get("id")
                 chat_title = chat.get("title") or chat.get("username") or "unknown"
 
+                if known_chats_path is not None:
+                    record_known_chat(known_chats_path, chat)
+
+                if is_command(message, "groups", bot_username):
+                    if chat.get("type") == "private":
+                        text = (
+                            format_known_groups_html(known_chats_path)
+                            if known_chats_path is not None
+                            else "Known chat registry is disabled."
+                        )
+                        send_message(token, int(chat_id), text)
+                    elif debug:
+                        print(f"[debug] /groups ignored outside private chat: chat_id={chat_id}")
+                    continue
+
+                # Only react to messages that carry a file attachment. Plain text,
+                # photos, stickers, joins/leaves, etc. are ignored immediately so
+                # after discovering the group, the bot does no extra work in busy chats.
+                document = message.get("document")
+                if not isinstance(document, dict):
+                    continue
+
                 if debug:
-                    doc = message.get("document")
-                    fname = doc.get("file_name") if doc else None
-                    print(f"[debug] message from chat_id={chat_id} ({chat_title})  file={fname}")
+                    print(f"[debug] document from chat_id={chat_id} ({chat_title})  file={document.get('file_name')}")
 
                 if allowed_chat_ids is not None and chat_id not in allowed_chat_ids:
                     if debug:
@@ -346,7 +626,7 @@ def run_bot(
 
                 if reply_on_upload:
                     snapshot = format_snapshot(result.latest_week)
-                    dashboard_link = f'<a href="{_pipeline.DASHBOARD_URL}">Open Dashboard</a>'
+                    dashboard_link = f'<a href="{pipeline.DASHBOARD_URL}">Open Dashboard</a>'
                     if result.duplicate:
                         send_reply(
                             token,
@@ -381,7 +661,7 @@ def run_bot(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Watch a Telegram group for .zip/.json uploads and push them to Google Drive."
+        description="Watch Telegram groups for config.json uploads and push them to Google Drive."
     )
     p.add_argument(
         "--token",
@@ -409,6 +689,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the bot state JSON file.",
     )
     p.add_argument(
+        "--known-chats-path",
+        default=os.getenv("TELEGRAM_KNOWN_CHATS_PATH", "known_chats.json"),
+        help="Path to a JSON registry of every chat the bot has seen (for discovering group IDs).",
+    )
+    p.add_argument(
+        "--list-known-groups",
+        action="store_true",
+        help="Print groups currently known from known_chats.json and exit.",
+    )
+    p.add_argument(
         "--allowed-chat-ids",
         default=os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", ""),
         help="Comma-separated Telegram chat IDs to accept (empty = all).",
@@ -430,6 +720,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    known_chats_path = Path(args.known_chats_path)
+
+    if args.list_known_groups:
+        print(format_known_groups_plain(known_chats_path))
+        return 0
 
     if not args.token:
         print("Missing Telegram bot token. Set TELEGRAM_BOT_TOKEN or pass --token.", file=sys.stderr)
@@ -440,6 +735,8 @@ def main() -> int:
         print("Download it from: Google Cloud Console -> APIs & Services -> Credentials -> OAuth 2.0 Client ID -> Desktop app", file=sys.stderr)
         return 2
 
+    from drive_uploader import build_drive_service
+
     drive_service = build_drive_service(args.credentials_file, args.token_file)
     allowed_chat_ids = parse_allowed_chat_ids(args.allowed_chat_ids)
 
@@ -448,6 +745,7 @@ def main() -> int:
         drive_service=drive_service,
         download_dir=Path(args.download_dir),
         state_path=Path(args.state_path),
+        known_chats_path=known_chats_path,
         allowed_chat_ids=allowed_chat_ids,
         reply_on_upload=args.reply_on_upload,
         debug=args.debug,

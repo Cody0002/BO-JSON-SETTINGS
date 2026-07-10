@@ -16,7 +16,10 @@ telegram_drive_bot/credentials.json
 # Bot secrets & runtime state
 telegram_drive_bot/.env
 telegram_drive_bot/bot_state.json
+telegram_drive_bot/known_chats.json
 telegram_drive_bot/telegram_downloads/
+telegram_drive_bot/token.json.bak.*
+known_chats.json
 
 # Generated data files
 dashboard_data.json
