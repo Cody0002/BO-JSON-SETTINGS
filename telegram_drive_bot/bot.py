@@ -4,6 +4,23 @@ Telegram → Google Drive bot.
 Joins Telegram groups, records them when first seen, and watches for config.zip/config.json file uploads.
 Each matching file is downloaded and immediately uploaded to a Google Drive folder.
 
+What counts as a weekly upload:
+    * any file named ``*config.zip`` / ``*config.json`` (e.g. 20260615_kz-group-config.zip)
+    * any file whose name mentions the export (kz-group-config, kz_group_config, ...)
+    * any .zip/.json whose caption names such a file or says "config export" /
+      "group config" / "weekly config"
+Files are picked up whether they are sent directly, forwarded, posted to a channel,
+edited, quoted in a reply, or pinned. A .zip/.json that misses these rules gets a
+reply saying it was skipped — the bot never ignores a plausible upload in silence,
+and failures are reported in the group rather than only in the log.
+
+IMPORTANT — group privacy mode:
+    A bot only receives file uploads in a group when privacy mode is off there.
+    BotFather's /setprivacy applies to groups joined *afterwards*; Telegram caches
+    the setting per group at join time. For a group that was joined earlier, either
+    promote the bot to administrator or remove and re-add it. Send /ping in a chat
+    to check what the bot can see there.
+
 Setup:
     pip install -r requirements.txt
 
@@ -70,13 +87,87 @@ def load_pipeline():
 # File-type detection
 # ---------------------------------------------------------------------------
 
+# Telegram's Bot API refuses to serve files above 20 MB through getFile.
+MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024
+
+# "20260615_kz-group-config.zip", "kz_config.json", "BO-config.ZIP" ...
+_CONFIG_NAME_RE = re.compile(r"config\.(?:zip|json)$", re.IGNORECASE)
+# The weekly export's own name, in any spelling, anywhere in a name or caption.
+_KZ_CONFIG_RE = re.compile(r"kz[-_ ]?group[-_ ]?config", re.IGNORECASE)
+# A full filename mentioned inside a caption, e.g. "here is 20260615_kz-group-config.zip".
+_CONFIG_TOKEN_RE = re.compile(r"[\w.\-]*config[\w.\-]*\.(?:zip|json)", re.IGNORECASE)
+_CAPTION_HINTS = ("config export", "group config", "weekly config", "bo config", "bo settings")
+_SUPPORTED_EXTENSIONS = (".zip", ".json")
+# Clients label zips inconsistently; octet-stream is what most desktop uploads send.
+_SUPPORTED_MIME = {
+    "application/zip",
+    "application/x-zip",
+    "application/x-zip-compressed",
+    "multipart/x-zip",
+    "application/json",
+    "text/json",
+    "application/octet-stream",
+}
+
+
+def message_text(message: Optional[Dict[str, Any]]) -> str:
+    """Every bit of text a message carries: caption, plain text, and any quote."""
+    if not isinstance(message, dict):
+        return ""
+    quote = message.get("quote") or {}
+    parts = (message.get("caption"), message.get("text"), quote.get("text"))
+    return " ".join(str(p) for p in parts if p)
+
+
+def target_reason(document: Dict[str, Any], message: Optional[Dict[str, Any]] = None) -> str:
+    """Why this attachment counts as a weekly config upload — '' means it doesn't.
+
+    The name alone decides it whenever the file is called ``*config.zip`` /
+    ``*config.json`` or mentions the export by name. Anything else has to be a
+    zip/json *and* be introduced as a config export by the caption, so an
+    unrelated archive dropped in the group is left alone.
+    """
+    file_name = str(document.get("file_name") or "").strip()
+    mime = str(document.get("mime_type") or "").strip().lower()
+    text = message_text(message)
+
+    if _CONFIG_NAME_RE.search(file_name) or _KZ_CONFIG_RE.search(file_name):
+        return f"filename '{file_name}'"
+
+    if file_name:
+        supported = file_name.lower().endswith(_SUPPORTED_EXTENSIONS)
+    else:
+        # Telegram occasionally hands us a document with no name at all.
+        supported = mime in _SUPPORTED_MIME
+
+    if not supported:
+        return ""
+
+    if _KZ_CONFIG_RE.search(text):
+        return "caption names the weekly config export"
+    named = _CONFIG_TOKEN_RE.search(text)
+    if named:
+        return f"caption names '{named.group(0)}'"
+    lowered = text.lower()
+    for hint in _CAPTION_HINTS:
+        if hint in lowered:
+            return f"caption says '{hint}'"
+    return ""
+
+
 def is_target_document(document: Dict[str, Any], message: Optional[Dict[str, Any]] = None) -> bool:
+    return bool(target_reason(document, message))
+
+
+def looks_like_config_candidate(document: Dict[str, Any]) -> bool:
+    """A zip/json that *might* have been meant as the weekly upload.
+
+    Used to tell the group why a file was skipped instead of ignoring it silently.
+    """
     file_name = str(document.get("file_name") or "").lower()
-    caption = str((message or {}).get("caption") or "").lower()
-    is_config_name = file_name.endswith("config.zip") or file_name.endswith("config.json")
-    is_supported_file = file_name.endswith(".zip") or file_name.endswith(".json")
-    is_config_caption = "config export" in caption or "group config" in caption
-    return is_config_name or (is_supported_file and is_config_caption)
+    if file_name:
+        return file_name.endswith(_SUPPORTED_EXTENSIONS)
+    return str(document.get("mime_type") or "").lower() in _SUPPORTED_MIME
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +307,27 @@ _TRANSIENT_ERRORS = (URLError, TimeoutError, OSError)
 # HTTP statuses that are transient on Telegram's side (rate limit / gateway).
 _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
+# A 50-second long poll held open around the clock will always collect dropped
+# sockets, read timeouts and the occasional Telegram 502 — they are recovered by
+# the retry below and mean nothing on their own. Logging each one buries the
+# lines that matter, so they are counted here and reported once an hour instead.
+_TRANSIENT_SUMMARY_SECONDS = 3600.0
+_transient_events: Dict[str, int] = {}
+
+
+def note_transient(method: str) -> None:
+    _transient_events[method] = _transient_events.get(method, 0) + 1
+
+
+def drain_transient_summary() -> Optional[str]:
+    """One line covering every recovered network blip since the last call."""
+    if not _transient_events:
+        return None
+    total = sum(_transient_events.values())
+    detail = ", ".join(f"{name} x{count}" for name, count in sorted(_transient_events.items()))
+    _transient_events.clear()
+    return f"Network: recovered from {total} transient error(s) [{detail}] - no action needed."
+
 
 def telegram_api(
     token: str,
@@ -224,6 +336,7 @@ def telegram_api(
     *,
     retries: int = 3,
     backoff: float = 2.0,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     query = f"?{urlencode(params)}" if params else ""
     url = f"https://api.telegram.org/bot{token}/{method}{query}"
@@ -246,25 +359,35 @@ def telegram_api(
             if attempt >= retries:
                 raise
             last_exc = exc
-        print(
-            f"  Telegram {method}: transient error ({last_exc}); "
-            f"retry {attempt}/{retries - 1} in {backoff * attempt:.0f}s...",
-            file=sys.stderr,
-        )
+        note_transient(method)
+        if verbose:
+            print(
+                f"  Telegram {method}: transient error ({last_exc}); "
+                f"retry {attempt}/{retries - 1} in {backoff * attempt:.0f}s...",
+                file=sys.stderr,
+            )
         time.sleep(backoff * attempt)
 
     raise last_exc if last_exc else RuntimeError(f"Telegram API call failed: {method}")
 
 
-def iter_updates(token: str, offset: Optional[int], timeout_seconds: int) -> Iterable[Dict[str, Any]]:
+def iter_updates(
+    token: str,
+    offset: Optional[int],
+    timeout_seconds: int,
+    *,
+    verbose: bool = False,
+) -> Iterable[Dict[str, Any]]:
     params: Dict[str, Any] = {
         "timeout": timeout_seconds,
-        "allowed_updates": json.dumps(["message", "channel_post", "my_chat_member"]),
+        "allowed_updates": json.dumps(list(_MESSAGE_UPDATE_KEYS) + ["my_chat_member"]),
     }
     if offset is not None:
         params["offset"] = offset
 
-    result = telegram_api(token, "getUpdates", params)
+    # Generous retries: a 502 burst from Telegram should be ridden out quietly
+    # rather than escalating into a "Polling error" line every time.
+    result = telegram_api(token, "getUpdates", params, retries=6, verbose=verbose)
     items = result.get("items", [])
     return items if isinstance(items, list) else []
 
@@ -291,8 +414,10 @@ def download_telegram_file(
             return
         except _TRANSIENT_ERRORS as exc:
             tmp.unlink(missing_ok=True)  # discard the partial file before retrying
+            note_transient("download")
             if attempt >= retries:
                 raise
+            # Kept loud: a download stalls a specific upload someone is waiting on.
             print(
                 f"  Download {output_path.name}: transient error ({exc}); "
                 f"retry {attempt}/{retries - 1} in {backoff * attempt:.0f}s...",
@@ -331,19 +456,92 @@ def send_message(token: str, chat_id: int, text: str) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Every update kind that can carry a document, edits included.
+_MESSAGE_UPDATE_KEYS = ("message", "edited_message", "channel_post", "edited_channel_post")
+# Places a document can hide inside a message besides the attachment itself.
+_NESTED_MESSAGE_KEYS = ("reply_to_message", "external_reply", "pinned_message")
+
+
 def get_message(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    for key in ("message", "channel_post"):
+    for key in _MESSAGE_UPDATE_KEYS:
         msg = update.get(key)
         if isinstance(msg, dict):
             return msg
     return None
 
 
+def is_edit_update(update: Dict[str, Any]) -> bool:
+    return any(key.startswith("edited_") and isinstance(update.get(key), dict) for key in _MESSAGE_UPDATE_KEYS)
+
+
+@dataclass
+class Attachment:
+    """A document found in an update, plus where to reply about it."""
+
+    document: Dict[str, Any]
+    carrier: Dict[str, Any]        # message the file is attached to (caption, date)
+    reply_message_id: int          # message the bot replies to
+    nested: bool = False           # found via a quote/pin rather than sent directly
+
+    @property
+    def unique_id(self) -> str:
+        return str(self.document.get("file_unique_id") or self.document.get("file_id") or "")
+
+    @property
+    def file_name(self) -> str:
+        return str(self.document.get("file_name") or "")
+
+
+def documents_in_message(
+    message: Dict[str, Any],
+    seen_ids: Set[str],
+    *,
+    is_edit: bool = False,
+) -> list[Attachment]:
+    """Every attachment in one update that is worth inspecting.
+
+    The directly attached file always counts, so a re-upload still gets an
+    answer. Files reached indirectly — a reply quoting the upload, a pinned
+    upload, a caption edit — only count while we have never fetched them, so
+    quoting an already-processed zip doesn't restart the flow.
+    """
+    chat_id = (message.get("chat") or {}).get("id")
+    outer_id = message.get("message_id")
+    found: list[Attachment] = []
+    seen_here: Set[str] = set()
+
+    def add(carrier: Any, *, nested: bool) -> None:
+        if not isinstance(carrier, dict):
+            return
+        document = carrier.get("document")
+        if not isinstance(document, dict) or not document.get("file_id"):
+            return
+        unique_id = str(document.get("file_unique_id") or document.get("file_id"))
+        if unique_id in seen_here or (nested and unique_id in seen_ids):
+            return
+        seen_here.add(unique_id)
+
+        # Reply on the carrier itself when it lives in this chat; an
+        # external_reply points at another chat, so answer the message we got.
+        carrier_id = carrier.get("message_id")
+        same_chat = (carrier.get("chat") or {}).get("id") in (None, chat_id)
+        reply_id = carrier_id if isinstance(carrier_id, int) and same_chat else outer_id
+        if not isinstance(reply_id, int):
+            return
+        found.append(Attachment(document=document, carrier=carrier, reply_message_id=reply_id, nested=nested))
+
+    add(message, nested=is_edit)
+    for key in _NESTED_MESSAGE_KEYS:
+        add(message.get(key), nested=True)
+    return found
+
+
 def build_greeting(bot_name: str) -> str:
     """Short, friendly intro the bot posts when it joins a group."""
     return (
         f"👋 Hi, I'm <b>{bot_name}</b>! 🤖\n"
-        f"Just drop the weekly <b>*config.zip</b> or <b>*config.json</b> here and I'll auto-refresh the dashboard for you. ✨📊"
+        f"Just drop the weekly <b>*config.zip</b> or <b>*config.json</b> here and I'll auto-refresh the dashboard for you. ✨📊\n"
+        f"Send <code>/ping</code> any time to check I can see this chat."
     )
 
 
@@ -397,16 +595,32 @@ def sanitize_filename(name: str) -> str:
     return name or "telegram_upload"
 
 
+_DATE_SEPARATORS_RE = re.compile(r"(\d{4})[-/._](\d{2})[-/._](\d{2})")
+
+
 def source_label_for_snapshot(message: Dict[str, Any], document: Dict[str, Any], fallback_path: Path) -> str:
-    """Caption first, then filename, so the weekly date can come from either."""
-    caption = str(message.get("caption") or "").strip()
+    """The string the pipeline reads the snapshot date out of.
+
+    The filename wins when it carries a date (``20260615_kz-group-config.zip``).
+    Otherwise the caption is appended so an undated file can still be dated by
+    whoever posted it — ``2026-06-15`` there is normalised to ``20260615``.
+    """
     file_name = sanitize_filename(str(document.get("file_name") or fallback_path.name))
-    return f"{caption} {file_name}".strip() if caption else file_name
+    if re.search(r"\d{8}", file_name):
+        return file_name
+
+    caption = _DATE_SEPARATORS_RE.sub(r"\1\2\3", message_text(message)).strip()
+    return f"{file_name} {caption}".strip() if caption else file_name
 
 
-def staging_path(download_dir: Path, message: Dict[str, Any], document: Dict[str, Any]) -> Path:
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id", "unknown")
+def staging_path(
+    download_dir: Path,
+    message: Dict[str, Any],
+    document: Dict[str, Any],
+    chat_id: Optional[int] = None,
+) -> Path:
+    if chat_id is None:
+        chat_id = (message.get("chat") or {}).get("id", "unknown")
     raw_date = message.get("date")
     dt = datetime.fromtimestamp(raw_date, tz=timezone.utc) if isinstance(raw_date, int) else datetime.now(tz=timezone.utc)
     timestamp = dt.strftime("%Y%m%d_%H%M%S")
@@ -444,42 +658,50 @@ class PipelineResult:
     duplicate: bool = False
 
 
+class TooLargeError(Exception):
+    """The file exceeds the Bot API's 20 MB getFile ceiling."""
+
+
 def process_document(
     token: str,
-    message: Dict[str, Any],
+    attachment: Attachment,
+    chat_id: int,
     download_dir: Path,
     seen_ids: Set[str],
     drive_service,
-) -> Optional[PipelineResult]:
+) -> PipelineResult:
     pipeline = load_pipeline()
-    document = message.get("document")
-    if not isinstance(document, dict) or not is_target_document(document, message):
-        return None
+    document = attachment.document
+    message = attachment.carrier
+
+    file_size = document.get("file_size")
+    if isinstance(file_size, int) and file_size > MAX_TELEGRAM_FILE_BYTES:
+        raise TooLargeError(f"{file_size / 1024 / 1024:.1f} MB")
 
     # Always download and run the full pipeline, even for a file we've seen
     # before: the pipeline dedups by snapshot week and the bot replies
     # "already processed" instead of staying silent on re-uploads.
-    file_unique_id = str(document.get("file_unique_id") or document.get("file_id") or "")
+    file_unique_id = attachment.unique_id
 
     file_id = str(document["file_id"])
     file_info = telegram_api(token, "getFile", {"file_id": file_id})
     remote_path = str(file_info["file_path"])
 
-    local_path = staging_path(download_dir, message, document)
+    local_path = staging_path(download_dir, message, document, chat_id=chat_id)
     download_telegram_file(token, remote_path, local_path)
 
     original_name = sanitize_filename(str(document.get("file_name") or local_path.name))
-    chat = message.get("chat") or {}
+    snapshot_source = source_label_for_snapshot(message, document, local_path)
 
     try:
-        result = pipeline.run(drive_service, local_path, original_name=original_name)
+        result = pipeline.run(drive_service, local_path, original_name=snapshot_source)
     except pipeline.DuplicateWeekError as exc:
         seen_ids.add(file_unique_id)
         local_path.unlink(missing_ok=True)
         week_fmt = f"{exc.week[:4]}-{exc.week[4:6]}-{exc.week[6:]}" if len(exc.week) == 8 else exc.week
         return PipelineResult(
-            chat_id=int(chat.get("id")),
-            message_id=int(message.get("message_id")),
+            chat_id=chat_id,
+            message_id=attachment.reply_message_id,
             original_name=original_name,
             drive_link="",
             weeks_count=0,
@@ -490,8 +712,8 @@ def process_document(
     seen_ids.add(file_unique_id)
 
     return PipelineResult(
-        chat_id=int(chat.get("id")),
-        message_id=int(message.get("message_id")),
+        chat_id=chat_id,
+        message_id=attachment.reply_message_id,
         original_name=original_name,
         drive_link=result.get("drive_link", ""),
         weeks_count=result.get("weeks_count", 0),
@@ -520,11 +742,13 @@ def run_bot(
     next_update_id: Optional[int] = state.get("next_update_id")
     pipeline = load_pipeline()
 
+    can_read_all = False
     try:
         me = telegram_api(token, "getMe")
         bot_id: Optional[int] = int(me["id"])
         bot_name = me.get("first_name") or me.get("username") or "KZG BO Bot"
         bot_username = str(me.get("username") or "")
+        can_read_all = bool(me.get("can_read_all_group_messages"))
     except (HTTPError, URLError, TimeoutError, RuntimeError, OSError, KeyError, ValueError) as exc:
         print(f"Warning: getMe failed ({exc}); group greetings disabled.", file=sys.stderr)
         bot_id, bot_name, bot_username = None, "KZG BO Bot", ""
@@ -534,12 +758,31 @@ def run_bot(
     print(f"Dashboard file ID : {pipeline.DASHBOARD_DRIVE_FILE_ID}")
     if bot_id is not None:
         print(f"Bot identity      : {bot_name} (id={bot_id})")
+    print(f"Allowed chats     : {'all' if allowed_chat_ids is None else sorted(allowed_chat_ids)}")
+    print(f"Reads all group messages: {can_read_all}")
+    if not can_read_all:
+        print(
+            "WARNING: privacy mode is ON — in groups the bot only receives commands and\n"
+            "         replies to itself, so file uploads never arrive. Disable it via\n"
+            "         BotFather (/setprivacy -> Disable), then REMOVE AND RE-ADD the bot to\n"
+            "         each existing group: Telegram caches the mode per group at join time.",
+            file=sys.stderr,
+        )
     if debug:
         print("[debug] Debug mode ON — all incoming updates will be printed.")
 
+    next_summary_at = time.monotonic() + _TRANSIENT_SUMMARY_SECONDS
+    consecutive_failures = 0
+
     while True:
         try:
-            updates = list(iter_updates(token, next_update_id, poll_timeout_seconds))
+            updates = list(iter_updates(token, next_update_id, poll_timeout_seconds, verbose=debug))
+
+            if time.monotonic() >= next_summary_at:
+                summary = drain_transient_summary()
+                if summary:
+                    print(summary)
+                next_summary_at = time.monotonic() + _TRANSIENT_SUMMARY_SECONDS
 
             for update in updates:
                 update_id = update.get("update_id")
@@ -586,6 +829,9 @@ def run_bot(
                 if known_chats_path is not None:
                     record_known_chat(known_chats_path, chat)
 
+                if debug:
+                    print(f"[debug] message from chat_id={chat_id} ({chat_title}) type={chat.get('type')}")
+
                 if is_command(message, "groups", bot_username):
                     if chat.get("type") == "private":
                         text = (
@@ -598,73 +844,140 @@ def run_bot(
                         print(f"[debug] /groups ignored outside private chat: chat_id={chat_id}")
                     continue
 
-                # Only react to messages that carry a file attachment. Plain text,
-                # photos, stickers, joins/leaves, etc. are ignored immediately so
-                # after discovering the group, the bot does no extra work in busy chats.
-                document = message.get("document")
-                if not isinstance(document, dict):
-                    continue
-
-                if debug:
-                    print(f"[debug] document from chat_id={chat_id} ({chat_title})  file={document.get('file_name')}")
-
-                if allowed_chat_ids is not None and chat_id not in allowed_chat_ids:
-                    if debug:
-                        print(f"[debug] chat_id={chat_id} not in allowed list, skipping.")
-                    continue
-
-                try:
-                    result = process_document(
-                        token=token,
-                        message=message,
-                        download_dir=download_dir,
-                        seen_ids=seen_ids,
-                        drive_service=drive_service,
+                if is_command(message, "ping", bot_username):
+                    allowed = allowed_chat_ids is None or chat_id in allowed_chat_ids
+                    send_reply(
+                        token,
+                        int(chat_id),
+                        int(message["message_id"]),
+                        "✅ I can see this chat.\n"
+                        f"- chat_id: <code>{chat_id}</code> ({escape(str(chat.get('type')))})\n"
+                        f"- accepting uploads here: <b>{'yes' if allowed else 'no'}</b>\n"
+                        f"- reads all group messages: <b>{'yes' if can_read_all else 'no'}</b>",
                     )
-                except Exception as exc:
-                    print(f"Error processing document: {exc}", file=sys.stderr)
                     continue
 
-                if result is None:
+                # Only react to messages carrying a file. Plain text, photos,
+                # stickers, joins/leaves, etc. cost nothing beyond this check.
+                attachments = documents_in_message(message, seen_ids, is_edit=is_edit_update(update))
+                if not attachments:
                     continue
 
-                state["uploaded_file_unique_ids"] = sorted(seen_ids)
-                save_state(state_path, state)
+                for attachment in attachments:
+                    document = attachment.document
+                    size = document.get("file_size")
+                    where = "quoted/pinned" if attachment.nested else "attached"
+                    print(
+                        f"Document seen ({where}): chat={chat_id} ({chat_title}) "
+                        f"file={attachment.file_name or '<unnamed>'} "
+                        f"size={size} mime={document.get('mime_type')} "
+                        f"caption={message_text(attachment.carrier)[:120]!r}"
+                    )
 
-                if result.duplicate:
-                    print(f"Duplicate week: {result.original_name} -> week {result.latest_week} already available, skipped.")
-                else:
-                    print(f"Pipeline done: {result.original_name} -> dashboard updated ({result.weeks_count} weeks, latest {result.latest_week})")
+                    if allowed_chat_ids is not None and chat_id not in allowed_chat_ids:
+                        print(f"  Skipped: chat_id={chat_id} is not in TELEGRAM_ALLOWED_CHAT_IDS.")
+                        continue
 
-                if reply_on_upload:
-                    snapshot = format_snapshot(result.latest_week)
-                    dashboard_link = f'<a href="{pipeline.DASHBOARD_URL}">Open Dashboard</a>'
+                    reason = target_reason(document, attachment.carrier)
+                    if not reason:
+                        print(f"  Skipped: not a weekly config upload ({attachment.file_name or '<unnamed>'}).")
+                        # A zip/json that just missed the naming rule is worth
+                        # saying out loud — silence here is what hides mistakes.
+                        if reply_on_upload and looks_like_config_candidate(document):
+                            send_reply(
+                                token,
+                                int(chat_id),
+                                attachment.reply_message_id,
+                                f"I saw <b>{escape(attachment.file_name or 'this file')}</b> but skipped it — "
+                                "I only process the weekly export, named like "
+                                "<code>20260615_kz-group-config.zip</code> "
+                                "(or any <code>*config.zip</code> / <code>*config.json</code>).",
+                            )
+                        continue
+
+                    print(f"  Matched: {reason} — running pipeline...")
+
+                    try:
+                        result = process_document(
+                            token=token,
+                            attachment=attachment,
+                            chat_id=int(chat_id),
+                            download_dir=download_dir,
+                            seen_ids=seen_ids,
+                            drive_service=drive_service,
+                        )
+                    except TooLargeError as exc:
+                        print(f"  Error: file is {exc} — over the 20 MB Bot API limit.", file=sys.stderr)
+                        if reply_on_upload:
+                            send_reply(
+                                token,
+                                int(chat_id),
+                                attachment.reply_message_id,
+                                f"❌ <b>{escape(attachment.file_name or 'That file')}</b> is {escape(str(exc))} — "
+                                "Telegram only lets me download files up to 20 MB. "
+                                "Please send a smaller archive or share it via Drive.",
+                            )
+                        continue
+                    except Exception as exc:
+                        print(f"Error processing document: {exc}", file=sys.stderr)
+                        if reply_on_upload:
+                            send_reply(
+                                token,
+                                int(chat_id),
+                                attachment.reply_message_id,
+                                f"❌ I received <b>{escape(attachment.file_name or 'the file')}</b> but the update failed:\n"
+                                f"<code>{escape(str(exc)[:400])}</code>",
+                            )
+                        continue
+
+                    state["uploaded_file_unique_ids"] = sorted(seen_ids)
+                    save_state(state_path, state)
+
                     if result.duplicate:
-                        send_reply(
-                            token,
-                            result.chat_id,
-                            result.message_id,
-                            f"This data is already available — snapshot <b>{snapshot}</b> was already processed. No update needed.",
-                        )
+                        print(f"Duplicate week: {result.original_name} -> week {result.latest_week} already available, skipped.")
                     else:
-                        send_reply(
-                            token,
-                            result.chat_id,
-                            result.message_id,
-                            f"KZG BO Settings dashboard updated from <b>{result.original_name}</b>\n"
-                            f"- Latest Snapshot: <b>{snapshot}</b>\n"
-                            f"- {dashboard_link}",
-                        )
+                        print(f"Pipeline done: {result.original_name} -> dashboard updated ({result.weeks_count} weeks, latest {result.latest_week})")
+
+                    if reply_on_upload:
+                        snapshot = format_snapshot(result.latest_week)
+                        dashboard_link = f'<a href="{pipeline.DASHBOARD_URL}">Open Dashboard</a>'
+                        if result.duplicate:
+                            send_reply(
+                                token,
+                                result.chat_id,
+                                result.message_id,
+                                f"This data is already available — snapshot <b>{snapshot}</b> was already processed. No update needed.",
+                            )
+                        else:
+                            send_reply(
+                                token,
+                                result.chat_id,
+                                result.message_id,
+                                f"KZG BO Settings dashboard updated from <b>{escape(result.original_name)}</b>\n"
+                                f"- Latest Snapshot: <b>{snapshot}</b>\n"
+                                f"- {dashboard_link}",
+                            )
 
             save_state(state_path, state)
+
+            consecutive_failures = 0
 
         except KeyboardInterrupt:
             save_state(state_path, state)
             print("\nStopped.")
             return
         except (HTTPError, URLError, TimeoutError, RuntimeError, OSError) as exc:
-            print(f"Polling error: {exc}. Retrying in 10 s...", file=sys.stderr)
-            time.sleep(10)
+            # Only reached once the retries inside iter_updates are exhausted, so
+            # this is a real outage. Back off instead of hammering, and log the
+            # first failure plus every tenth so a long outage stays one screenful.
+            consecutive_failures += 1
+            delay = min(10 * consecutive_failures, 300)
+            if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                print(
+                    f"Polling error (#{consecutive_failures}): {exc}. Retrying in {delay} s...",
+                    file=sys.stderr,
+                )
+            time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
